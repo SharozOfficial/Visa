@@ -1,0 +1,584 @@
+class ClassDelimitedFile:
+    """ 
+    Class:  ClassDelimitedFile 
+
+    Provides methods on Delimited File objects in ADLS.
+
+    Attributes
+    ----------
+    No Public Attributes
+
+    Methods
+    ----------
+    Read
+        Returns a dataframe with the file contents.  Optionally filtered by highwatermark, with optional
+        columns
+
+    ApplyTargetProcess
+        Carries out the process on the CSV File to apply changes in supplied
+        dataframe
+
+    """
+
+    def __init__(self, **kwargs):
+        Log.Write('Initialising ClassDelimitedFile')
+        
+        self.EntityFullyQualifiedName = kwargs.get("EntityFullyQualifiedName") 
+        if self.EntityFullyQualifiedName != None:
+            self.oProperties = ClassProperties(EntityFullyQualifiedName = self.EntityFullyQualifiedName)
+        else:
+            self.oProperties = oProperties
+
+        if self.oProperties == None:
+            e = "Neither EntityFullyQualifiedName or oProperties object passed to ClassDelimitedFile."
+            raise Exception(e)
+
+        self.Action = kwargs.get("Action")
+
+        
+        self._Role = kwargs.get("Role")
+        if self._Role == None:
+            self._Role = "Undefined"
+
+        Log.Write(f"Role: {self._Role}")
+        
+        DataSourceType = kwargs.get("DataSourceType")
+        if DataSourceType == None:
+            self.DataSourceType = "singletable"
+        else:
+            self.DataSourceType = "multitable"
+
+        # mandatory properties 
+        _FileFormat = self.oProperties.System.FileFormat
+        self.FileHeader = _FileFormat.Header
+        self.Delimiter = _FileFormat.ColumnDelimiter
+        self.FilePath = f"{self.oProperties.MountPoint}/{self.oProperties.System.EntityPath}"
+        self.Extension = _FileFormat.Extension
+        self.EntityName = self.oProperties.System.EntityName
+
+
+        Log.Write(f"ClassCSVFile: FilePath: {self.FilePath} FileFormat: {_FileFormat} FileHeader: {self.FileHeader} Delimiter: {self.Delimiter}")
+
+        # non-mandatory properties
+        # TODO put in condition to check for actual 'not found' error in except block
+        try:
+            self.Escape = _FileFormat.Escape
+        except Exception as e:
+            self.Escape = "\\" 
+        try:
+            self.FailFast = _FileFormat.FailFast
+        except Exception as e:
+            self.FailFast = "true"
+        try:
+            self.MultiLine = _FileFormat.MultiLine
+        except Exception as e:
+            self.MultiLine = "true"
+        try:
+            self.UnescapedQuoteHandling = _FileFormat.UnescapedQuoteHandling
+        except Exception as e:
+            self.UnescapedQuoteHandling = "STOP_AT_DELIMITER"
+
+        Log.Write(f"ClassCSVFile: Escape: {self.Escape} FailFast: {self.FailFast} MultiLine: {self.MultiLine} UnescapedQuoteHandling: {self.UnescapedQuoteHandling}")
+
+        # DataSourceType
+        # This is used in main: if set to 'multitable' the execution of DQ, application of change, HWM etc. is handled by the 
+        # Action Function itself.  This defaults to 'singletable' so does not need to be set except in this situation.
+        #
+        try:
+            self.DataSourceType = oProperties.Extended.Curate.DataSourceType.lower()
+        except:
+            self.DataSourceType = "singletable"
+
+        if self.DataSourceType == None:
+            self.DataSourceType = "singletable"
+        else:
+            self.DataSourceType = self.DataSourceType
+
+        if Debug == 1:
+            print (f"DataSourceType: {self.DataSourceType} ")
+
+        # SourceEntity
+        # this is used optionally in setting HWM path where Entity is populated by multiple sources with different HWMs.
+        # Use SetSourceEntity(SourceEntity = [source Entity]) to set
+        #
+        self.SourceEntity = None 
+
+        # MetaFile
+        # Creates a MetaFile instance associated with this Entity Instance
+        # if you want to use a Source= in the path of the metafile, call SetSourceEntity before
+        # calling MetaFile.GetHWM or MetaFile.WriteMetaFile
+        #
+        self.MetaFile = ClassMetaFile(Entity = self)
+
+
+        if self._Role.lower() == "source":
+            self.CurrentHWM = spark.sql("SELECT now()").head()[0]
+            # TODO: replace this with logic on Inserted/UpdatedDateTime (or some indicator from .properties)?
+        elif self._Role.lower() == "sink":
+            self.CurrentHWM = ClassMetaFile(Entity = self).GetHighWaterMark()
+        else:
+            self.CurrentHWM = "1970-01-01T00:00:00.000+0000"
+
+        self.NewHWM = "1970-01-01T00:00:00.000+0000"
+
+
+    def GetCurrentHWM(self):
+        Log.Write(f"** ClassDelimitedFile.GetCurrentHWM - Started")
+    
+        Log.Write(f"** ClassDelimitedFile.GetCurrentHWM - Completed")
+
+        return (self.CurrentHWM)
+
+    def GetNewHWM(self):
+        Log.Write(f"** ClassDelimitedFile.GetNewHWM - Started")
+    
+        Log.Write(f"** ClassDelimitedFile.GetNewHWM - Completed")
+
+        return (self.NewHWM)
+
+    def SetCurrentHWM(self, **kwargs):
+        # For multiple source entities for an Entity, this enables setting of the HWM
+        # for a given source.  
+        # The Source parameter is an Entity representing the source
+
+        Log.Write(f"** ClassDelimitedFile.SetCurrentHWM - Started")
+    
+        # # to support multiple sources for an entity
+        # TODO THIS IS GOING TO FALL OVER AT SOME POINT
+        SourceEntityName = self.SourceEntity.oProperties.System.EntityName
+
+        self.CurrentHWM = self.MetaFile.GetHighWaterMark(Source = SourceEntityName)
+
+        Log.Write(f"** ClassDelimitedFile.SetCurrentHWM - Completed")
+
+    def WriteNewHWM(self, **kwargs):
+        # write the meta file
+        Log.Write(f"ClassDelimitedFile.WriteNewHWM - Started")
+        
+        if self.SourceEntity != None:
+            SourceEntityName = self.SourceEntity.EntityName
+            if Debug == 1:
+                Log.Write(f"WriteNewHWM called with source: {SourceEntityName}")
+        else:
+            SourceEntityname = None
+        Log.Write(f"ClassDelimitedFile: writing MetaFile")
+        RowsAffected = kwargs.get("RowsAffected")
+        if RowsAffected == None:
+            print("RowsAffected is None")
+            try:
+                RowsAffected = self.dfResult.collect()[0][0]
+            except Exception as e:
+                if "'NoneType' object has no attribute 'count'" in  str(e):
+                    RowsAffected = 0
+                else:
+                    raise Exception(e)
+
+        if RowsAffected == None:
+            RowsAffected = 0
+
+        NewHWM = self.GetNewHWM()
+
+        Log.Write(f"main: RowsAffected: {RowsAffected}")
+
+        Log.Write(f"main: NewHWM: {NewHWM}")
+        
+        print(RowsAffected, NewHWM)
+
+        self.MetaFile.WriteMetaFile(NumberOfRows = RowsAffected)
+
+
+        Log.Write(f"ClassDelimitedFile.WriteNewHWM - Completed")
+
+
+    def SetChangeData(self, **kwargs):
+        # This is used primarily for Sink entities (self.Role = "Sink")
+        # This attaches the dataframe containing the data to be merged etc. to the Sink object
+        Log.Write(f"** ClassDelimitedFile.SetChangeData - Started")
+        dfChangeData = kwargs.get("ChangeData")
+
+        self.dfChangeData = dfChangeData
+        Log.Write(f"** ClassDelimitedFile.SetChangeData - Completed")
+
+
+    def GetFilesToProcess(self, **kwargs): #(MetafilePath,MetafileName,previous_hwm):  
+        
+        Log.Write(f"** ClassDelimitedFile.GetFilesToProcess - Started")
+
+        HighWaterMarkLowerBound = kwargs.get("HighWaterMarkLowerBound")
+        if HighWaterMarkLowerBound == None:
+            HighWaterMarkLowerBound = "1970-01-01T00:00:00.000+0000"
+
+        HighWaterMarkUpperBound = kwargs.get("HighWaterMarkUpperBound")
+        if HighWaterMarkUpperBound == None:
+            HighWaterMarkUpperBound = "3000-01-01T00:00:00.000+0000"
+
+        Log.Write(f"HighWaterMarkLowerBound: {HighWaterMarkLowerBound} HighWaterMarkUpperBound: {HighWaterMarkUpperBound}")
+
+        MetafilePath = self.oProperties.System.EntityPath
+        MetafileName = self.oProperties.System.EntityName + ".meta"
+        FullMetafilePath =  f"{self.MetaFile.MetaFilePath}/{MetafileName}/Status=Current/"
+        print ("#######################################################################################")
+        #print(f"ClassDelimitedFile.GetFilesToProcess: FullMetafilePath: {FullMetafilePath}")
+        #print(f"self.MetaFile.MetaFilePath: {self.MetaFile.MetaFilePath}")
+
+        if Debug == 1: Log.Write(f"ClassDelimitedFile.GetFilesToProcess: MetafilePath: {MetafilePath} MetafileName: {MetafileName} FullMetafilePath: {FullMetafilePath}")
+
+        df_filtered = Utility.EmptyDataframe()        
+
+        try:
+            if Debug==1: Log.Write(f"ClassDelimitedFile.GetFilesToProcess: Reading Metafile: {FullMetafilePath}"
+                                   )
+            df_Metafiles = spark.read.format("com.databricks.spark.csv") .load(FullMetafilePath , sep = ",", inferSchema = "false",header="true")
+            df_Metafiles = df_Metafiles \
+                .withColumn("FilePath", df_Metafiles.FilePath.cast("string")) \
+                .withColumn("NumberOfRows", df_Metafiles.NumberOfRows.cast("integer")) \
+                .withColumn("FileName", df_Metafiles.FileName.cast("string")) \
+                .withColumn("ProcessedDateTime", df_Metafiles.ProcessedDateTime.cast("timestamp"))
+        
+            df_filtered = df_Metafiles.filter(col("NumberOfRows") > 0).filter(col("ProcessedDateTime")>HighWaterMarkLowerBound).filter(col("ProcessedDateTime")<=HighWaterMarkUpperBound)
+            
+            if Debug == 1: display(df_filtered)
+
+        except Exception as e:
+            # if "" in str(e):
+            #     Log.Write(f"** ClassDelimitedFile.GetFilesToProcess - No metafiles found at {FullMetafilePath}")
+            # else:
+            raise Exception(e)
+            
+
+        if (df_filtered.count() > 0):
+            df_filtered_final = df_filtered.withColumn('FilePathName',concat(lit(MetafilePath),lit('/'),col('FilePath'),lit('/'),col('FileName')))
+            #FileToRead = df_filtered_final.select(['FilePathName']).rdd.flatMap(lambda x: x).collect()
+
+            return (df_filtered_final)
+            
+        else:
+            return(None)
+
+    def ReadMultipleFiles(self, **kwargs):
+
+        # Get file list, iterate, append to dataframe
+        Log.Write(f"** ClassDelimitedFile.ReadMultipleFiles - Started")
+
+        dfFilesToProcess = self.GetFilesToProcess()
+        if dfFilesToProcess == None:
+            return(None)
+        
+        FileList = dfFilesToProcess.select(['FilePathName']).rdd.flatMap(lambda x: x).collect()
+        
+        Log.Write(f"Found {len(FileList)} files to process")
+
+        for FilePath in FileList:
+            if FilePath == FileList[0]:
+                Log.Write(f"ClassDelimitedFile.ReadMultipleFiles: Processing file {FilePath}")
+                df = self.ReadFile(FilePath = f"{self.oProperties.MountPoint}/{FilePath}")
+            else:
+                Log.Write(f"ClassDelimitedFile.ReadMultipleFiles: Processing file {FilePath}")
+                df = df.union(self.ReadFile(FilePath = f"{self.oProperties.MountPoint}/{FilePath}")).cache()
+        
+        Log.Write(f"** ClassDelimitedFile.ReadMultipleFiles - Completed")
+
+        if Debug==1: display(df)
+        return(df)
+
+    def Read(self, **kwargs):
+        # Returns a dataframe containing data retrieved from the DelimitedFile entity.
+        # Two modes
+        # 1. Read from a path with a wildcard filter
+        # - also applying HWM filter
+        # 2. Identify files to load and read iteratively
+        # - apply HWM filter
+
+        # How to differentiate on calling
+        # - if FilePathFilter present - use (1)
+        #   i.e. if you wish to use this method, provide FilePathFilter in the .properties file
+
+        # - if FilePathFilter not present - use (2)
+        #   only needs HWM, no other parameters needed
+
+        # Method 1 - current functionality
+
+        # Method 2 - call GetFiles
+        # 	   iterate over files, calling ReadAFile
+        # 	   union together to get output
+
+        Log.Write(f"** ClassDelimitedFile.Read - Started")
+
+        HighWaterMark = kwargs.get("HighWaterMark")
+        if HighWaterMark == None:
+            # default HWM to 1 Jan 1900 - this will effectively not filter any files by ModifiedDate
+            HighWaterMark = "1900-01-01 00:00:00.000"
+        else:
+            Log.Write(f"ClassDelimitedFile.Read: HighWaterMark: {HighWaterMark}")
+
+        FilePathFilter = kwargs.get("FilePathFilter")
+        if FilePathFilter == "":
+            FilePathFilter = None
+        ExtraColumns = kwargs.get("ExtraColumns")
+        if ExtraColumns == None:
+            ExtraColumns = "[]"
+        
+        if FilePathFilter != None:
+
+            FilteredFilePath = f"{self.FilePath}{FilePathFilter}" #self.FilePath +'/2*/*/*/*'
+
+            Log.Write(f"ClassDelimitedFile.Read: FilteredFilePath: {FilteredFilePath}")
+
+            sLog = f"        df = spark.read.format('csv').option('header', {self.FileHeader}).option('failFast', {self.FailFast}).option('delimiter',{self.Delimiter}).option('unescapedQuoteHandling', {self.UnescapedQuoteHandling}).option('multiLine', {self.MultiLine}).option('escape', {self.Escape}).load({FilteredFilePath})"
+
+            Log.Write(f"ClassDelimitedFile.Read: execution statement: {sLog}")
+
+            df = self.ReadFile(FilePath = FilteredFilePath)
+
+            if HighWaterMark != None:
+                Log.Write (f"ClassDelimitedFile.Read: Filtering files with file_modification_time > {HighWaterMark}")
+                df = df.filter(df.file_modification_time > HighWaterMark)        
+        
+        if FilePathFilter == None:
+            df = self.ReadMultipleFiles(HighWaterLowerBound = HighWaterMark)
+
+        if "MemberType" in ExtraColumns:
+            Log.Write("Adding MemberType")
+            df = df.withColumn('MemberType',lit('Standard'))
+        if "InsertedDateTime" in ExtraColumns:
+            Log.Write("ClassDelimitedFile.Read: Adding InsertedDateTime")
+            df = df.withColumn('InsertedDateTime',lit(current_timestamp()))
+        if "UpdatedDateTime" in ExtraColumns:
+            Log.Write("ClassDelimitedFile.Read: Adding UpdatedDateTime")
+            df = df.withColumn('UpdatedDateTime',lit(current_timestamp()))
+
+
+        Log.Write(f"** ClassDelimitedFile.Read - Completed")
+
+        return(df)
+
+    def CustomFileParser(self, txt):
+        NewTxt = ""
+        Header = txt.splitlines(keepends=False)[0] # get first line
+        HeaderLength = len(Header) # get its character length
+        HeaderList = Header.split(self.Delimiter) # Returns a list of the header fields
+        HeaderElementCount = HeaderList.__len__() ## get count of header fields
+        txt = txt[HeaderLength:] # strip header off
+
+        Probe = "§"
+
+        txt = txt.replace(self.Delimiter, Probe) # simplify the delimiters - makes character-based processing simpler
+        #print(txt)
+
+        # Following process has to assume that there are no unquoted carriage returns in the last field in a row
+        RowStart = 0
+        RowEnd = None
+        RowCount = 0
+        DelimiterCount = 1 #treat start of line as first delimiter
+        txt = txt[1:] # avoids issue of whitespace at start of body (leftover from LN from the header)
+        CharacterCount = len(txt)
+        for i in range(0, CharacterCount): #process each character
+            if txt[i] == Probe: # found a field delimiter
+                DelimiterCount += 1
+                if DelimiterCount == HeaderElementCount: #if we're on the last field...
+                    # ...look ahead to end of row (newline delimited)
+                    DistanceToCarriageReturn = txt[i:].find(chr(13))
+                    if DistanceToCarriageReturn == -1: # if we're on the last record
+                        RowEnd = len(txt)
+                    else: # if we're not on the last record add distance to newline to get position of end of row
+                        RowEnd = i + DistanceToCarriageReturn
+                    Row = txt[RowStart:RowEnd] # get the row
+
+                    # now process the row by:
+                    # - stripping the opening/closing quote off the *row*
+                    # - replacing any quote-delimiter-quote with the delimiter
+                    # - replacing and quotes left with escaped quotes
+                    # - replacing the delimiter with quote-delimiter-quote
+                    #print(f"Old: {Row}")
+                    SubRow = Row[2:-1].replace(f"\"{Probe}\"", Probe).replace('\"', '\\"').replace(Probe,f"\"{self.Delimiter}\"")
+                    # add the opening/closing quote back on
+                    Row = '\"' + SubRow + '\"'
+                    #print(f"New: {Row}")
+                    
+                    NewTxt += Row + "\n" # add the row to the output
+                    RowStart = RowEnd + 1 # reset the start of the next row
+                    RowCount += 1
+                    DelimiterCount = 1 # reset the delimiter count
+
+        NewTxt = Header + "\n" + NewTxt # add the header back on
+        if Debug == 1: Log.Write(f"ClassDelimitedFile.CustomFileParser: RowCount: {RowCount} Input CharacterCount: {CharacterCount} OutputCharacterCount: {len(NewTxt)}")
+        return(NewTxt)
+
+
+    def ReadFile(self, **kwargs):
+        import pyspark.sql.functions as f
+        import re
+
+        FilePath = kwargs.get("FilePath")
+        Log.Write(f"ClassDelimitedFile.ReadFile: FilePath: {FilePath}")
+
+
+        StripEvenCharactersFromRawFile = self.oProperties.GetProperty(Property="System.FileFormat.StripEvenCharactersFromRawFile")
+        if StripEvenCharactersFromRawFile == True:
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Stripping even characters from raw file")
+
+            # This is a special case for SAFE, but it may come in useful elsewhere so making it generic
+            # SAFE data has proven difficult to work with.  The ICD defines it as UTF-16, but reading it with that encoding has not yielded 
+            # expected results.
+            # After a _lot_ of shouting, crying etc. found the working approach is to read the file as a 'text', and then strip every other letter.
+            # See 'Notes' at the end of this Class for more information
+            # To initiate this behaviour, add this to the RAW properties file:
+            # System.FileFormat.StripEvenCharactersFromRawFile = True
+
+            # read the file into a dataframe, with all the text in a single cell, and add the filename/modified time
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Reading whole file as text into a single cell")
+            fileDataAlldf = spark.read.format('text').option('wholetext', True).load(FilePath).select("*","_metadata.file_name","_metadata.file_modification_time")
+
+            # create an empty array
+            output = []
+            # get the data into a list
+            txt0 = fileDataAlldf.collect()
+            for row in txt0:
+                if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Stripping even characters from raw file")
+                #txt = row[0][::2] # this strips every other letter from the string
+                txt = row[0].replace(chr(0), "")
+                if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Escaping unescaped quotes")
+                txt = self.CustomFileParser(txt)
+                file_name = row[1] # capturing this for later
+                file_modification_time = row[2] # capturing this for later
+                output.append(txt) # add just the text to the array
+
+            # create a dataframe from the text values
+            dfOut = spark.createDataFrame([(output)], ['txt'])
+
+            # tempRawFileName
+            
+            tempFilePath = FilePath.replace('.dat', '_TEMP.dat')
+            Log.Write(f"ClassDelimitedFile.ReadFile: tempFilePath: {tempFilePath}")
+
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Writing cleaned file to {tempFilePath}")
+
+            # write this cleaned text out to a temporary file
+            dfOut.coalesce(1)\
+                .write\
+                .format('text')\
+                .mode('overwrite')\
+                .option('header','true')\
+                .option('encoding','US-ASCII')\
+                .save(tempFilePath)
+
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Reading cleaned file from {tempFilePath}")
+            # read this cleaned file into the dataframe we will finally use
+            df = spark.read\
+            .option("unescapedQuoteHandling", "STOP_AT_DELIMITER")\
+            .option("escape", '\\')\
+            .option("encoding", "UTF-8")\
+            .option("quote", "\"")\
+            .option("multiLine", "true")\
+            .option("header", "true")\
+            .option("delimiter","|*")\
+            .option("failFast", "true")\
+            .csv(tempFilePath)
+            
+            df.cache()
+
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Adding file_name and file_modification_time to dataframe")
+            # add the filename and modification time into the dataframe
+            df = df.withColumn('file_name', f.lit(file_name)).withColumn('file_modification_time', f.lit(file_modification_time))
+
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Removing temporary file {tempFilePath}")
+            # remove the temporary file
+            # TODO Tidy this up!  Cannot remove here as the final data is not read until the df (above) is read, and the file is still needed at that point.
+            # dbutils.fs.rm(tempFilePath, recurse=True)
+
+        else:
+            FilePath = kwargs.get("FilePath")
+
+            if Debug == 1: Log.Write(f"ClassDelimitedFile.ReadFile: Reading file {FilePath}")
+            df = spark.read\
+                .format('csv')\
+                .option('header', self.FileHeader)\
+                .option('failFast', self.FailFast)\
+                .option('delimiter',self.Delimiter)\
+                .option('unescapedQuoteHandling', self.UnescapedQuoteHandling)\
+                .option('multiLine', self.MultiLine)\
+                .option('escape', self.Escape)\
+                .load(FilePath)\
+                .select("*", "_metadata.file_name","_metadata.file_modification_time")
+
+        return(df)
+
+    def GetChangeData(self, **kwargs):
+        # Behaviour differs based upon self.Role
+        # If the entity is a Source, this returns the dataframe containing the 'delta' data increment 
+        # defined by the HWM processing
+        # If the entity is a Sink, this returns the dataframe set by SetChangeData()
+        # If the entity is Undefined, behaviour is same as for 'Sink'
+
+        Log.Write(f"** ClassDelimitedFile.GetChangeData - Started")
+        
+        dfChange = self.Read(**kwargs)
+
+        Log.Write(f"** ClassDelimitedFile.GetChangeData - Completed")
+
+        return(dfChange)
+        
+
+    def TruncateReloadFromDataframe(self, **kwargs):
+
+        dfChange = kwargs.get("dfChange")
+
+        WritePath = f"{self.FilePath}/{self.EntityName}.{self.Extension}".replace("..",".")
+        Log.Write(f"Overwriting data at {WritePath}")
+
+        self.dfResult = dfChange.write.mode("overwrite") \
+        .format("com.databricks.spark.csv") \
+        .option('header', self.FileHeader)\
+        .option('failFast', self.FailFast)\
+        .option('delimiter',self.Delimiter)\
+        .option('unescapedQuoteHandling', self.UnescapedQuoteHandling)\
+        .option('multiLine', self.MultiLine)\
+        .option('escape', self.Escape)\
+        .save(WritePath)
+
+        return(self.dfResult)
+   
+
+    def ApplyTargetProcess(self, **kwargs):
+        
+        dfChange = kwargs.get("dfChange")
+        Action = kwargs.get("Action")
+
+        ActionProperties = self.oProperties.GetActionProperties(Action)
+        
+        TargetProcess = ActionProperties.TargetProcess
+
+        TargetProcess = ActionProperties.TargetProcess
+        if dfChange == None:
+            self.dfResult = spark.createDataFrame([0], IntegerType())
+        elif dfChange.count() == 0:
+            self.dfResult = spark.createDataFrame([0], IntegerType())
+        else:
+            if TargetProcess.lower() == "truncatereload" or TargetProcess.lower() == "overwrite":
+                dfResult = self.TruncateReloadFromDataframe(dfChange = dfChange)
+            else:
+                e = f"Process {TargetProcess} not supported on entity type of DelimitedFile."
+                raise Exception(e)
+        try:
+            RowCount = self.dfResult.collect()[0][0]
+        except:
+            RowCount = -1
+
+        self.WriteNewHWM(RowsAffected = RowCount)
+
+        self.TargetProcessResult = self.dfResult
+
+        return self.dfResult
+
+    def SetAction(self, **kwargs):
+        self.Action = kwargs.get("Action")
+
+
+# Notes on 'ReadFile' method
+# I didn't want to have to use this horribly clunky method for 'SAFE' data , but the core bit of it - txt = row[0][::2] - which strips the even 
+# numbered characters  from the string - is not supported if used within .withColumn(...), which precludes _simply_ defining it as a 
+# 'CleansingTransformation' Along the way I investigated using .encode/.decode to try to convert from the stated UTF-16 to UTF-8 (which enables 
+# use of read.csv with multi- character delimiters), as well as playing with all the .encoding() options when reading the file (which are # ‘US-ASCII’, 
+# ‘ISO-8859-1’, ‘UTF-8’,  ‘UTF-16BE’, ‘UTF-16LE’, ‘UTF-16’, ‘UTF-32’).  Nothing seemed to get past the apparent 'extra character'  after each character.
+# I guess it might be something deep down in how Python interprets strings; there is a hidden indicator that a string # sequence is complete, and 
+# it looks like these are getting picked up after every character and interpreted as whitespace.
