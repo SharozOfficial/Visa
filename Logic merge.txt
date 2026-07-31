@@ -1,0 +1,74 @@
+# ------------------------------------------------------------------
+# STEP 10 - Build SCD2 merge clause components
+#
+# OnClause: uses _GetMergeOnClauseColumns -> reads NaturalKey (QCID)
+# -> this is correct and unchanged.
+#
+# AndMatchedClause: NOT using _GetAndMatchedClause from the framework.
+# Reason: _GetAndMatchedClause uses <> which fails silently on NULL
+# columns (NULL <> anything = NULL = not TRUE in SQL). With 200 columns
+# and nullable attributes, this would silently miss changes where either
+# side is NULL. We build this clause locally using IS DISTINCT FROM,
+# which correctly treats NULL as a comparable value.
+#
+# Excluded from change detection:
+#   - SCD2 system columns (EffectiveStartDate, EffectiveEndDate, IsActive)
+#     These are added by this notebook, not from source data.
+#   - Audit/metadata columns (InsertedDateTime, UpdatedDateTime,
+#     filePath, fileName, fileDate, businessYear, hashedKey)
+#     These change on every file load regardless of business data change
+#     and must not trigger a false SCD2 version.
+# ------------------------------------------------------------------
+
+OnClause = Entity._GetMergeOnClauseColumns(
+    SourceAlias = "source",
+    SinkAlias   = "sink"
+)
+
+Log.Write(f"OnClause: {OnClause}")
+
+# Columns excluded from change detection
+# Add or remove from this list based on what CalculateAttribute
+# adds for this entity — these are columns that change on every
+# load regardless of whether business data actually changed.
+EXCLUDED_FROM_CHANGE_DETECTION = {
+    "effectivestartdate",
+    "effectiveenddate",
+    "isactive",
+    "inserteddatetime",
+    "updateddatetime",
+    "filepath",
+    "filename",
+    "filedate",
+    "businessyear",
+    "hashedkey"          # adjust name to match your actual hashed key column name
+}
+
+# Build AND MATCHED clause using IS DISTINCT FROM
+# Reads all catalogue attributes — same source as _GetAndMatchedClause
+# but with NULL-safe comparison operator.
+catalogueAttributes = Entity.oProperties.Catalogue.Schema.Attributes
+
+andMatchedParts = []
+for attr in catalogueAttributes:
+    colName = str(attr.Name).strip()
+    if colName.lower() not in EXCLUDED_FROM_CHANGE_DETECTION:
+        andMatchedParts.append(
+            f"sink.{colName} IS DISTINCT FROM source.{colName}"
+        )
+
+if not andMatchedParts:
+    raise Exception(
+        "DeltaLoadMriTenant: AndMatchedClause is empty after exclusions. "
+        "Check EXCLUDED_FROM_CHANGE_DETECTION — too many columns excluded."
+    )
+
+AndMatchedClause = "AND (" + " OR ".join(andMatchedParts) + ")"
+
+Log.Write(f"AndMatchedClause column count: {len(andMatchedParts)}")
+if Debug == 1:
+    Log.Write(f"AndMatchedClause: {AndMatchedClause}")
+
+# InsertColumnList — built from actual dataframe columns after
+# SCD2 cols are added (same as before, no change here)
+InsertColumnList = ",".join(dfIncremental.columns)
