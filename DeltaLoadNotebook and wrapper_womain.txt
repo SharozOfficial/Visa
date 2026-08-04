@@ -1,0 +1,76 @@
+# ------------------------------------------------------------------
+# Wrapper orchestration for cleanse with SCD2
+# Replaces: Main = main(Entity=SinkEntity, Action=Action)
+#
+# Reason: main.PerformTransformation for cleanse action calls
+# ApplyTargetProcess(TargetProcess=Merge) after transformations —
+# a standard upsert with no SCD2 logic. DeltaLoadMriTenant is never
+# reached via main for cleanse action.
+#
+# Instead we orchestrate the three phases here directly:
+#   Phase 1 — Read source incrementally
+#   Phase 2 — Apply CleansingTransformations
+#   Phase 3 — Call DeltaLoadMriTenant for SCD2 merge
+# All logic remains in the framework and action function notebooks.
+# ------------------------------------------------------------------
+
+Log.Write(f"dmsWrapper: Starting orchestration for {EntityFullyQualifiedName} - {Action}")
+
+# Phase 1 — Instantiate source and get HWM boundaries
+oSinkProperties = SinkEntity.oProperties
+Source_Entities = oSinkProperties.Extended.Cleanse.SourceEntities
+SourceEFQN      = Source_Entities[0].EFQN
+
+SourceEntity    = Utility.GetEntity(
+    EntityFullyQualifiedName = SourceEFQN,
+    Role                     = "Source",
+    connectiontype           = "jdbc"
+)
+
+SinkCurrentHWM   = SinkEntity.GetCurrentHWM()
+SourceCurrentHWM = SourceEntity.GetCurrentHWM()
+
+Log.Write(f"dmsWrapper: SinkCurrentHWM:   {SinkCurrentHWM}")
+Log.Write(f"dmsWrapper: SourceCurrentHWM: {SourceCurrentHWM}")
+
+SinkEntity.SetSourceEntity(SourceEntity=SourceEntity)
+SinkEntity.SetNewHWM(NewHWM=SourceCurrentHWM)
+
+# Phase 2 — Read source data and apply CleansingTransformations
+try:
+    Source_file_filter = oSinkProperties.Extended.Cleanse.SourceFilePathFilter
+except Exception:
+    Source_file_filter = None
+
+dfChangeData = SourceEntity.Read(
+    HighWaterMark  = SinkCurrentHWM,
+    FilePathFilter = Source_file_filter
+)
+
+Log.Write(f"dmsWrapper: Rows read from source: {dfChangeData.count()}")
+
+# Apply CleansingTransformations
+CleansingTransformations = oSinkProperties.Extended.Cleanse.CleansingTransformations
+oCleansing   = Cleansing()
+dfChangeData = oCleansing.PerformCleansingTransformations(dfChangeData, CleansingTransformations)
+
+Log.Write("dmsWrapper: CleansingTransformations applied")
+
+# Arrange columns in catalogue order
+oSinkProps_forCols = ClassProperties(EntityFullyQualifiedName=EntityFullyQualifiedName)
+ColumnOrder        = oSinkProps_forCols.GetColumnList()
+ColumnList         = [c.strip() for c in ColumnOrder.split(",")]
+existing_cols      = dfChangeData.columns
+ColumnList_safe    = [c for c in ColumnList if c in existing_cols]
+dfChangeData       = dfChangeData.select(ColumnList_safe)
+
+Log.Write(f"dmsWrapper: Columns arranged. Count: {len(ColumnList_safe)}")
+
+# Set the cleansed data on the sink entity
+SinkEntity.SetChangeData(ChangeData=dfChangeData)
+
+# Phase 3 — Call DeltaLoadMriTenant for SCD2 merge
+Log.Write("dmsWrapper: Calling DeltaLoadMriTenant for SCD2 merge")
+dfResult = DeltaLoadMriTenant(Entity=SinkEntity, Action=Action)
+
+Log.Write(f"dmsWrapper: Completed {EntityFullyQualifiedName} - {Action}")

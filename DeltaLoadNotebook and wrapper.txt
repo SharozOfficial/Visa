@@ -1,0 +1,119 @@
+# =============================================================
+# dmsWrapper — SCD2 orchestration cell
+# Replaces: Main = main(Entity=SinkEntity, Action=Action)
+#
+# Follows main's exact sequence for cleanse/singletable:
+#   Phase 1: _GetTransformedData  (what main does — unchanged)
+#   Phase 2: DeltaLoadMriTenant   (replaces _CommitData only)
+#   Phase 3: _WriteHWM            (what main does — unchanged)
+#
+# Only Phase 2 differs from main. Phases 1 and 3 are identical
+# to what main would have done — no framework logic is bypassed
+# or duplicated, it is explicitly reproduced here from main's
+# own method bodies so the behaviour is identical.
+# =============================================================
+
+Log.Write(f"####################### dmsWrapper for {EntityFullyQualifiedName} - {Action} - Started")
+
+# ------------------------------------------------------------------
+# PHASE 1 — Replicate main._GetTransformedData + PerformTransformation
+# This is exactly what main does for cleanse/singletable before
+# calling _CommitData. Source is read, CleansingTransformations
+# applied, columns arranged, SetChangeData called on SinkEntity.
+# ------------------------------------------------------------------
+
+oSinkProperties = SinkEntity.oProperties
+
+# --- Read source incrementally (main.PerformTransformation for cleanse) ---
+Source_Entities  = oSinkProperties.Extended.Cleanse.SourceEntities
+SourceEFQN       = Source_Entities[0].EFQN
+
+SourceEntity = Utility.GetEntity(
+    EntityFullyQualifiedName = SourceEFQN,
+    Role                     = "Source",
+    connectiontype           = "jdbc"
+)
+
+# HWM boundaries — identical to main.PerformTransformation
+SinkCurrentHWM   = SinkEntity.GetCurrentHWM()
+SourceCurrentHWM = SourceEntity.GetCurrentHWM()
+
+Log.Write(f"SinkCurrentHWM:   {SinkCurrentHWM}")
+Log.Write(f"SourceCurrentHWM: {SourceCurrentHWM}")
+
+# SetSourceEntity and SetNewHWM — identical to main.PerformTransformation
+SinkEntity.SetSourceEntity(SourceEntity = SourceEntity)
+SinkEntity.SetNewHWM(NewHWM = SourceCurrentHWM)
+
+# Source file path filter — identical to main.PerformTransformation
+try:
+    Source_file_filter = oSinkProperties.Extended.Cleanse.SourceFilePathFilter
+except Exception as e:
+    if "'types.SimpleNamespace' object has no attribute 'SourceFilePathFilter'" in str(e):
+        Source_file_filter = None
+        Log.Write("Source_file_filter not found — not necessarily a problem.")
+    else:
+        raise e
+
+# Read incremental source data — identical to main.PerformTransformation
+dfChangeData = SourceEntity.Read(
+    HighWaterMark  = SinkCurrentHWM,
+    FilePathFilter = Source_file_filter
+)
+
+Log.Write(f"Rows read from source: {dfChangeData.count()}")
+
+# Apply CleansingTransformations — identical to main.PerformTransformation
+# GetActionFunctions for cleanse returns Extended.Cleanse.CleansingTransformations
+# and auto-appends InsertedDateTime/UpdatedDateTime if not already present
+CleansingTransformations = oSinkProperties.Extended.Cleanse.CleansingTransformations
+
+oCleansing   = Cleansing()
+dfChangeData = oCleansing.PerformCleansingTransformations(
+    dfChangeData,
+    CleansingTransformations
+)
+
+Log.Write("CleansingTransformations applied")
+
+# Arrange columns in catalogue order — identical to main.PerformTransformation
+ColumnOrder     = oSinkProperties.GetColumnList()
+ColumnList      = [c.strip() for c in ColumnOrder.split(",")]
+existing_cols   = dfChangeData.columns
+ColumnList_safe = [c for c in ColumnList if c in existing_cols]
+dfChangeData    = dfChangeData.select(ColumnList_safe)
+
+Log.Write(f"Columns arranged in catalogue order: {len(ColumnList_safe)} columns")
+
+# SetChangeData on SinkEntity — identical to main.PerformTransformation
+SinkEntity.SetChangeData(ChangeData = dfChangeData)
+
+Log.Write("Phase 1 complete — data ready on SinkEntity")
+
+# ------------------------------------------------------------------
+# PHASE 2 — Call DeltaLoadMriTenant instead of main._CommitData
+# main._CommitData would call ApplyTargetProcess → standard upsert.
+# We call DeltaLoadMriTenant instead → SCD2 two-pass merge.
+# DeltaLoadMriTenant reads dfChangeData via Entity.GetChangeData()
+# and handles: Create table, add SCD2 cols, Pass1 expire, Pass2 insert,
+# WriteNewHWM, Housekeeping.
+# ------------------------------------------------------------------
+Log.Write("Phase 2 — Calling DeltaLoadMriTenant for SCD2 merge")
+
+dfResult = DeltaLoadMriTenant(Entity=SinkEntity, Action=Action)
+
+Log.Write("Phase 2 complete — SCD2 merge done")
+
+# ------------------------------------------------------------------
+# PHASE 3 — Replicate main._WriteHWM
+# main._WriteHWM calls Entity.WriteNewHWM(Action=self.Action).
+# DeltaLoadMriTenant already calls WriteNewHWM internally (Step 7)
+# so this is a safe no-op second call — WriteNewHWM is idempotent.
+# Kept here explicitly so the sequence mirrors main exactly and
+# is not silently dropped if DeltaLoadMriTenant is ever refactored.
+# ------------------------------------------------------------------
+Log.Write("Phase 3 — Writing HWM")
+SinkEntity.WriteNewHWM(Action=Action)
+Log.Write("Phase 3 complete — HWM written")
+
+Log.Write(f"####################### dmsWrapper for {EntityFullyQualifiedName} - {Action} - Completed")
